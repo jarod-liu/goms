@@ -27,8 +27,21 @@ func (s *Server) ListenAndServe(addr string) {
 			log.Println("accept", err)
 			continue
 		}
-		conn := NewConn(c)
+		go s.serveConn(c)
+	}
+}
 
-		go conn.Handshake()
+func (s *Server) serveConn(conn *net.TCPConn) {
+	c := NewConn(conn)
+	err := c.Handshake()
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	for {
+		c.readChunk()
+		log.Printf("id=%d,len=%d,type=%d,ts=%d,tsd=%d,ts_ext=%v",
+			c.messageStreamId, c.messageLength, c.messageType, c.messageTimestamp, c.messageTimestampDelta, c.extendedTimestamp)
 	}
 }

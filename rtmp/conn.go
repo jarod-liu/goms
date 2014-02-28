@@ -2,42 +2,41 @@ package rtmp
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"time"
 )
 
-const (
-	handshakeLen = 1536
-)
-
 type Conn struct {
-	c    *net.TCPConn
-	hbuf []byte
-	ts   time.Time
+	c  *net.TCPConn
+	ts time.Time
 
-	messageStreamId       uint32
-	messageLength         uint32
-	extendedTimestamp     bool
-	messageTimestamp      uint32
-	messageTimestampDelta uint32
-	messageType           uint8
+	inChunkSize, outChunkSize uint32
+
+	chunkStreams map[uint32]*ChunkStream
 }
 
 func NewConn(conn *net.TCPConn) *Conn {
-	return &Conn{c: conn, hbuf: make([]byte, 2048)}
+	return &Conn{
+		c:            conn,
+		chunkStream:  make(map[uint32]*ChunkStream),
+		inChunkSize:  DEFAULT_CHUNK_SIZE,
+		outChunkSize: DEFAULT_CHUNK_SIZE}
 }
 
 func (c *Conn) Timestamp() uint32 {
 	return uint32((time.Now().UnixNano() - c.ts.UnixNano()) / 1000000)
 }
 
-func (c *Conn) Handshake() {
-	b := c.hbuf
-	_, err := c.c.Read(b[:1])
+// server side handshake
+func (c *Conn) Handshake() (err error) {
+	b := make([]byte, handshakeLen)
+	_, err = c.c.Read(b[:1])
 	if err != nil {
-		log.Println(err)
 		return
 	}
 
@@ -45,50 +44,125 @@ func (c *Conn) Handshake() {
 	c.c.Write(b[:1])
 	c.ts = time.Now()
 	binary.BigEndian.PutUint32(b, 0)
+	// a little random to the data
+	binary.BigEndian.PutUint32(b[8+rand.Intn(handshakeLen-8):], rand.Uint32())
 	_, err = c.c.Write(b[:handshakeLen])
 	if err != nil {
-		log.Println(err)
 		return
 	}
+	log.Println("S1 sent")
+
 	_, err = io.ReadFull(c.c, b[:handshakeLen])
 	if err != nil {
-		log.Println(err)
 		return
 	}
 	ct1 := binary.BigEndian.Uint32(b)
 	log.Printf("Get C1 time=%d\n", ct1)
 	binary.BigEndian.PutUint32(b[4:], c.Timestamp())
+	// a little random to the data
+	binary.BigEndian.PutUint32(b[8+rand.Intn(handshakeLen-8):], rand.Uint32())
 	_, err = c.c.Write(b[:handshakeLen])
 	if err != nil {
-		log.Println(err)
 		return
 	}
 	log.Println("S2 sent")
+
 	_, err = io.ReadFull(c.c, b[:handshakeLen])
 	if err != nil {
-		log.Println(err)
 		return
 	}
 	log.Println("Get C2. handshake completed.")
+	return
+}
 
-	c.readChunk()
-	log.Printf("id=%d,len=%d,type=%d,ts=%d,tsd=%d,ts_ext=%v",
-		c.messageStreamId, c.messageLength, c.messageType, c.messageTimestamp, c.messageTimestampDelta, c.extendedTimestamp)
-	c.readChunk()
-	log.Printf("id=%d,len=%d,type=%d,ts=%d,tsd=%d,ts_ext=%v",
-		c.messageStreamId, c.messageLength, c.messageType, c.messageTimestamp, c.messageTimestampDelta, c.extendedTimestamp)
-	for {
-		n, err := c.c.Read(b)
-		if err != nil {
-			log.Println(err)
-			break
-		}
-		log.Printf("%v\n", b[:n])
+func (c *Conn) chunkStream(id uint32) *ChunkStream {
+	cs, ok := c.chunkStreams[id]
+	if !ok {
+		cs = NewChunkStream(id)
+		c.chunkStreams[id] = cs
 	}
+	return cs
+}
+
+const maxChunkBasicHeaderSize = 11
+
+var chunkHeaderSize = []int{12, 8, 4, 1}
+
+func (c *Conn) ReadMessage() (m *Message, err error) {
+	hb := make([]byte, maxChunkBasicHeaderSize)
+	_, err = io.ReadFull(c.c, hb[:1])
+	if err != nil {
+		err = errors.New(err.Error() + ": Failed to read Basic Header 1st byte")
+		return
+	}
+
+	hfmt := uint8((hb[0] & 0xC0) >> 6)
+	csid := uint32(hb[0] & 0x3F)
+
+	switch csid {
+	case 0:
+		_, err = io.ReadFull(c.c, hb[1:2])
+		if err != nil {
+			err = errors.New(err.Error() + ": Failed to read Basic Header 2nd byte(cs id 0)")
+			return
+		}
+		csid = (uint32(hb[1]) + 64)
+
+	case 1:
+		_, err = io.ReadFull(c.c, hb[1:3])
+		if err != nil {
+			err = errors.New(err.Error() + ": Failed to read Basic Header 3rd byte(cs id 1)")
+			return
+		}
+		csid = binary.LittleEndian.Uint16(hb[1:]) + 64
+	}
+	cs := c.chunkStream(csid)
+
+	if hfmt == 0 {
+		m = NewMessage()
+	} else {
+		m = cs.Prev
+		m.HeaderFmt = hfmt
+	}
+	hsize := chunkHeaderSize[m.HeaderFmt] - 1
+	if m.HeaderFmt < 3 {
+		_, err = io.ReadFull(c.c, hb[:hsize])
+		if err != nil {
+			err = errors.New(fmt.Sprintf("%v: Failed to read Message Basic Header fmt=%d", err, m.HeaderFmt))
+			return
+		}
+
+		m.Timestamp = readUint24(hb)
+
+		if m.HeaderFmt < 2 {
+			m.Len = readUint24(hb[3:])
+			m.Type = uint8(hb[6])
+
+			if m.HeaderFmt == 0 {
+				m.StreamId = binary.LittleEndian.Uint32(b[7:])
+			}
+		}
+	}
+
+	if m.Timestamp == EXTENDED_TIMESTAMP {
+		_, err = io.ReadFull(c.c, hb[:4])
+		if err != nil {
+			err = errors.New(err.Error() + ": Failed to read Extended Timestamp")
+			return
+		}
+		m.Timestamp = binary.BigEndian.Uint32(hb)
+	}
+	if !m.IsAbsTimestamp {
+		m.Timestamp += m.Cs.Timestamp
+	}
+	m.Cs.Timestamp = m.Timestamp
+
+	io.ReadFull(c.c, b[:c.messageLength])
+	return
 }
 
 func (c *Conn) readChunk() (err error) {
-	b := c.hbuf
+	b := make([]byte, handshakeLen)
 	c.c.Read(b[:1])
 	fmt := uint32(b[0]) & 0xC0
 	csid := uint32(b[0]) & 0x3F
