@@ -9,42 +9,25 @@ import (
 	"time"
 )
 
-type Listener struct {
-	l *net.TCPListener
-}
-
-func Listen(laddr string) (l *Listener, err error) {
-	a, err := net.ResolveTCPAddr("tcp", laddr)
+func Dial(addr string) (c *ClientConn, err error) {
+	a, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
 		return
 	}
-	tl, err := net.ListenTCP("tcp", a)
+	tl, err := net.DialTCP("tcp", nil, a)
 	if err != nil {
 		return
 	}
-	l = &Listener{l: tl}
+	c = newClientConn(tl)
 	return
 }
 
-func (l *Listener) Accept() (c *ServerConn, err error) {
-	tc, err := l.l.AcceptTCP()
-	if err != nil {
-		return
-	}
-	c = newServerConn(tc)
-	return
-}
-
-func (l *Listener) Close() error {
-	return l.l.Close()
-}
-
-type ServerConn struct {
+type ClientConn struct {
 	conn
 }
 
-func newServerConn(tcpConn *net.TCPConn) *ServerConn {
-	return &ServerConn{conn{
+func newClientConn(tcpConn *net.TCPConn) *ClientConn {
+	return &ClientConn{conn{
 		c:            tcpConn,
 		chunkStreams: make(map[uint32]*ChunkStream),
 		inChunkSize:  DEFAULT_CHUNK_SIZE,
@@ -52,20 +35,14 @@ func newServerConn(tcpConn *net.TCPConn) *ServerConn {
 }
 
 // server side handshake
-func (c *ServerConn) Handshake() (err error) {
+func (c *ClientConn) Handshake() (err error) {
 	b := make([]byte, HANKSHAKE_MESSAGE_LEN)
-
-	_, err = c.c.Read(b[:1])
-	if err != nil {
-		return
-	}
-	log.Printf("Get C0=%d\n", b[0])
-
+	b[0] = 0x03
 	_, err = c.c.Write(b[:1])
 	if err != nil {
 		return
 	}
-	log.Println("S0 sent")
+	log.Println("C0 sent")
 
 	c.ts = time.Now()
 	binary.BigEndian.PutUint32(b, 0)
@@ -75,14 +52,21 @@ func (c *ServerConn) Handshake() (err error) {
 	if err != nil {
 		return
 	}
-	log.Println("S1 sent")
+	log.Println("C1 sent")
+
+	_, err = c.c.Read(b[:1])
+	if err != nil {
+		return
+	}
+	log.Printf("Get S0=%d\n", b[0])
 
 	_, err = io.ReadFull(c.c, b)
 	if err != nil {
 		return
 	}
-	ct1 := binary.BigEndian.Uint32(b)
-	log.Printf("Get C1 time=%d\n", ct1)
+	st1 := binary.BigEndian.Uint32(b)
+	log.Printf("Get S1 time=%d\n", st1)
+
 	binary.BigEndian.PutUint32(b[4:], c.Timestamp())
 	// a little random to the data
 	binary.BigEndian.PutUint32(b[8+rand.Intn(HANKSHAKE_MESSAGE_LEN-8):], rand.Uint32())
@@ -90,12 +74,12 @@ func (c *ServerConn) Handshake() (err error) {
 	if err != nil {
 		return
 	}
-	log.Println("S2 sent")
+	log.Println("C2 sent")
 
 	_, err = io.ReadFull(c.c, b)
 	if err != nil {
 		return
 	}
-	log.Println("Get C2. handshake completed.")
+	log.Println("Get S2. handshake completed.")
 	return
 }

@@ -18,11 +18,14 @@ type Message struct {
 	Cs *ChunkStream
 
 	HeaderFmt      uint8
-	Len            uint32
 	Type           uint8
 	IsAbsTimestamp bool
 	Timestamp      uint32
 	StreamId       uint32
+
+	Len       uint32
+	BytesRead uint32
+	Body      []byte
 }
 
 type ChunkStream struct {
@@ -37,15 +40,18 @@ func NewMessage() *Message {
 	}
 }
 
-func (m *Message) UsePrevValues() {
-	p := m.Cs.Prev
-	if p == nil {
-		return
-	}
-	m.Timestamp = p.Timestamp
+func (m *Message) Ready() bool {
+	return m.Len == m.BytesRead
 }
 
 func NewChunkStream(id uint32) *ChunkStream {
 	cs := &ChunkStream{Id: id}
 	return cs
+}
+
+func decodeUint24(b []byte) uint32 {
+	v := uint32(b[0]) << 16
+	v += uint32(b[1]) << 8
+	v += uint32(b[2])
+	return v
 }
